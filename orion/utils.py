@@ -22,14 +22,16 @@ import orion.constants as cnsts
 from orion.matcher import Matcher
 from orion.logger import SingletonLogger
 
+class NoDataFound(Exception):
+    pass
 
 class Utils:
     """
     Helper utils class
     """
 
-    def __init__(self, uuid_field: str ="uuid", version_field: str ="ocpVersion"):
-        """Instanciates utils class with uuid and version fields 
+    def __init__(self, uuid_field: str ="uuid",  version_field: str ="ocpVersion"):
+        """Instanciates utils class with uuid field
 
         Args:
             uuid_field (str): key to find the uuid
@@ -204,39 +206,6 @@ class Utils:
         return metadata
 
 
-    def filter_uuids_on_index(
-        self,
-        metadata: Dict[str, Any],
-        benchmark_index: str,
-        uuids: List[str],
-        match: Matcher,
-        baseline: str,
-        filter_node_count: bool,
-    ) -> List[str]:
-        """returns the index to be used and runs as uuids
-
-        Args:
-            metadata (_type_): metadata from config
-            uuids (_type_): uuids collected
-            match (_type_): Matcher object
-
-        Returns:
-            _type_: index and uuids
-        """
-        if "jobConfig.name" in metadata:
-            return uuids
-        if "benchmark.keyword" in metadata:
-            if metadata["benchmark.keyword"] in ["ingress-perf", "k8s-netperf"]:
-                return uuids
-            if baseline == "" and not filter_node_count and "kube-burner" in benchmark_index:
-                runs = match.match_kube_burner(uuids)
-                ids = match.filter_runs(runs, runs)
-            else:
-                ids = uuids
-        else:
-            ids = uuids
-        return ids
-
     def get_version(self, uuids: List[str], match: Matcher, timestamp_field: str) -> dict:
         """Gets the version of the run from each test
 
@@ -286,59 +255,41 @@ class Utils:
             tuple: A tuple of a dataframe and a dictionary of metrics
         """
         self.logger.info("The test %s has started", test["name"])
+        prs = {}
 
-        test_threshold=0
-        if "threshold" in test:
-            test_threshold=test["threshold"]
-        timestamp_field = "timestamp"
-        if "timestamp" in test:
-            timestamp_field=test["timestamp"]
+        test_threshold = test.get("threshold", 0)
+        timestamp_field = test.get("timestamp", "timestamp")
 
-        # getting metadata
-        metadata = (
-            self.extract_metadata_from_test(test)
-            if options["uuid"] in ("", None)
-            else self.get_metadata_with_uuid(options["uuid"], match)
-        )
         # get uuids, buildUrls matching with the metadata
-        additional_fields = [options["display"]] if options.get("display") else None
+        additional_fields = options.get("display")
+        additional_fields.append(options.get("version_field"))
         runs = match.get_uuid_by_metadata(
-            metadata,
+            test["metadata"],
             lookback_date=start_timestamp,
             lookback_size=options["lookback_size"],
             timestamp_field=timestamp_field,
             additional_fields=additional_fields
         )
         uuids = [run[self.uuid_field] for run in runs]
-        buildUrls = {run[self.uuid_field]: run["buildUrl"] for run in runs}
-        versions = self.get_version(uuids, match, timestamp_field)
-        prs = {uuid : self.sippy_pr_search(version) for uuid, version in versions.items()}
-        # get uuids if there is a baseline
-        if options["baseline"] not in ("", None):
-            uuids = [uuid for uuid in re.split(r" |,", options["baseline"]) if uuid]
+        # get uuids if there is a uuid
+        if options.get("uuid"):
             uuids.append(options["uuid"])
-            buildUrls = self.get_build_urls(uuids, match, timestamp_field)
-            versions = self.get_version( uuids, match, timestamp_field)
+            prs[options["uuid"]] = self.sippy_pr_search(options["uuid"])
         elif not uuids:
-            self.logger.info("No UUID present for given metadata")
-            return None, None
+            raise NoDataFound("No UUID present for the given metadata or uuid flag")
+        for run in runs:
+            if self.version_field in run:
+                prs[run[self.uuid_field]] = self.sippy_pr_search(run[self.version_field])
+            else:
+                self.logger.error("Sippy version field '%s' not found in run: %s", self.version_field, run)
         match.index = options["benchmark_index"]
-
-        uuids = self.filter_uuids_on_index(
-            metadata,
-            options["benchmark_index"],
-            uuids,
-            match,
-            options["baseline"],
-            options["node_count"],
-        )
         # get metrics data and dataframe
         metrics = test["metrics"]
         dataframe_list, metrics_config = self.get_metric_data(
             uuids, metrics, match, test_threshold, timestamp_field
         )
         if not dataframe_list:
-            return None, metrics_config
+            raise NoDataFound(f"Data not found for the uuids: {uuids}")
 
         uuid_timestamp_map = pd.DataFrame()
         for df in dataframe_list:
@@ -358,97 +309,25 @@ class Utils:
 
         merged_df = merged_df.merge(uuid_timestamp_map, on=self.uuid_field, how="left")
         merged_df = merged_df.sort_values(by="timestamp")
-
-        merged_df[self.version_field] = merged_df[self.uuid_field].apply(
-            lambda uuid: versions[uuid]
-        )
         merged_df["prs"] = merged_df[self.uuid_field].apply(lambda uuid: prs[uuid])
 
         # Add display field data if requested
         if options.get("display"):
-            display_field = options["display"]
-            display_data = {run[self.uuid_field]: run.get(display_field, "N/A") for run in runs}
-            merged_df[display_field] = merged_df[self.uuid_field].apply(
-                lambda uuid: display_data.get(uuid, "N/A")
-            )
-
-        shortener = pyshorteners.Shortener(timeout=10)
-        merged_df["buildUrl"] = merged_df[self.uuid_field].apply(
-            lambda uuid: (
-                self.shorten_url(shortener, buildUrls[uuid])
-                if options["convert_tinyurl"]
-                else buildUrls[uuid]
-            )
-            # pylint: disable = cell-var-from-loop
-        )
+            display_data = {run[self.uuid_field]: {field: run.get(field) for field in options["display"]} for run in runs}
+            for field in options["display"]:
+                merged_df[field] = merged_df[self.uuid_field].apply(
+                    lambda uuid: display_data.get(uuid, {}).get(field)
+                )
+        if options["convert_tinyurl"]:
+            shortener = pyshorteners.Shortener(timeout=10)
+            shorten_url_field = test.get("shorten_url_field", "buildUrl")
+            merged_df[shorten_url_field] = merged_df[shorten_url_field].apply(lambda url: shortener.tinyurl.short(url))
         merged_df = merged_df.reset_index(drop=True)
         # save the dataframe
         output_file_path = f"{options['save_data_path'].split('.')[0]}-{test['name']}.csv"
         match.save_results(merged_df, csv_file_path=output_file_path)
         return merged_df, metrics_config
 
-
-    def shorten_url(self, shortener: any, uuids: str) -> str:
-        """Shorten url if there is a list of buildUrls
-
-        Args:
-            shortener (any): shortener object to use tinyrl.short on
-            uuids (List[str]): List of uuids to shorten
-
-        Returns:
-            str: a combined string of shortened urls
-        """
-        short_url_list = []
-        for buildUrl in uuids.split(","):
-            short_url_list.append(shortener.tinyurl.short(buildUrl))
-        short_url = ",".join(short_url_list)
-        return short_url
-
-
-    def get_metadata_with_uuid(self, uuid: str, match: Matcher) -> Dict[Any, Any]:
-        """Gets metadata of the run from each test
-
-        Args:
-            uuid (str): str of uuid ot find metadata of
-            match: the fmatch instance
-
-
-        Returns:
-            dict: dictionary of the metadata
-        """
-        test = match.get_metadata_by_uuid(uuid)
-        metadata = {
-            "platform": "",
-            "clusterType": "",
-            "masterNodesCount": 0,
-            "workerNodesCount": 0,
-            "infraNodesCount": 0,
-            "masterNodesType": "",
-            "workerNodesType": "",
-            "infraNodesType": "",
-            "totalNodesCount": 0,
-            self.version_field: "",
-            "networkType": "",
-            "ipsec": "",
-            "fips": "",
-            "encrypted": "",
-            "publish": "",
-            "computeArch": "",
-            "controlPlaneArch": "",
-        }
-        for k, v in test.items():
-            if k not in metadata:
-                continue
-            metadata[k] = v
-        if "benchmark" in test:
-            metadata["benchmark.keyword"] = test["benchmark"]
-        if self.version_field in metadata:
-            metadata[self.version_field] = str(metadata[self.version_field])
-
-        # Remove any keys that have blank values
-        no_blank_meta = {k: v for k, v in metadata.items() if v}
-        self.logger.debug("No blank metadata dict: " + str(no_blank_meta))
-        return no_blank_meta
 
     def sippy_pr_diff(self, base_version: str, new_version: str) -> List[str]:
         """Get diff between two versions in sippy

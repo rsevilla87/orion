@@ -20,7 +20,6 @@ class Matcher:
         index (str): Name of the Elasticsearch index to interact with.
         es_url (str): Elasticsearch endpoint
         verify_certs (bool): Whether to verify SSL certificates when connecting to Elasticsearch.
-        version_field (str): Name of the field containing the OpenShift version.
         uuid_field (str): Name of the field containing the UUID.
     """
 
@@ -30,7 +29,6 @@ class Matcher:
         index: str = "ospst-perf-scale-ci",
         es_server: str = "https://localhost:9200",
         verify_certs: bool = True,
-        version_field: str = "ocpVersion",
         uuid_field: str = "uuid"
     ):
         self.index = index
@@ -42,26 +40,7 @@ class Matcher:
                              http_compress=True,
                              max_retries=3,
                              retry_on_timeout=True)
-        self.version_field = version_field
         self.uuid_field = uuid_field
-
-    def get_metadata_by_uuid(self, uuid: str) -> dict:
-        """Returns back metadata when uuid is given
-
-        Args:
-            uuid (str): uuid of the run
-
-        Returns:
-            _type_: _description_
-        """
-        query = Q("match",  **{self.uuid_field: f"{uuid}"})
-        result = {}
-        s = Search(using=self.es, index=self.index).query(query)
-        res = self.query_index(s)
-        hits = res.hits.hits
-        if hits:
-            result = dict(hits[0].to_dict()["_source"])
-        return result
 
     def query_index(self, search: Search, return_all: bool = False):
         """Query index using search_after
@@ -90,22 +69,21 @@ class Matcher:
 
             all_hits.extend(hits)
             search_after = response.hits[-1].meta.sort
-
         return all_hits
 
     # pylint: disable=too-many-locals
     def get_uuid_by_metadata(
         self,
-        meta: Dict[str, Any],
+        metadata: Dict[str, Any],
         lookback_date: datetime = None,
         lookback_size: int = 10000,
         timestamp_field: str = "timestamp",
-        additional_fields: List[str] = None
+        additional_fields: List[str] = []
     ) -> List[Dict[str, str]]:
         """gets uuid by metadata
 
         Args:
-            meta (Dict[str, Any]): metadata of the runs
+            metadata (Dict[str, Any]): metadata of the runs
             lookback_date (datetime, optional):
             The cutoff date to get the uuids from. Defaults to None.
             lookback_size (int, optional):
@@ -121,26 +99,15 @@ class Matcher:
         """
         must_clause = []
         must_not_clause = []
-        version = str(meta[self.version_field])[:4]
-
-        for field, value in meta.items():
-            if field in [self.version_field, "ocpMajorVersion"]:
-                continue
-            if field != "not":
-                must_clause.append(Q("match", **{field: str(value)}))
-            else:
-                for not_field, not_value in meta["not"].items():
-                    must_not_clause.append(Q("match", **{not_field: str(not_value)}))
-
-        if "ocpMajorVersion" in meta:
-            version = meta["ocpMajorVersion"]
-            filter_clause = [
-                Q("wildcard", ocpMajorVersion=f"{version}*"),
-            ]
-        else:
-            filter_clause = [
-                Q("wildcard", **{self.version_field: {"value": f"{version}*"}}),
-            ]
+        filter_clause = []
+        for not_field, not_value in metadata.pop("not", {}).items():
+            must_not_clause.append(Q("match", **{not_field: str(not_value)}))
+        for wildcard_field, wildcard_value in metadata.pop("wildcard", {}).items():
+            filter_clause.append(Q("wildcard", **{wildcard_field: str(wildcard_value)}))
+        for regexp_field, regexp_value in metadata.pop("regexp", {}).items():
+            filter_clause.append(Q("regexp", **{regexp_field: str(regexp_value)}))
+        for field, value in metadata.items():
+            must_clause.append(Q("match", **{field: str(value)}))
 
         if isinstance(lookback_date, datetime):
             lookback_date = lookback_date.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -158,94 +125,38 @@ class Matcher:
             .sort({timestamp_field: {"order": "desc"}})
             .extra(size=lookback_size)
         )
-        all_hits = self.query_index(s,return_all=True)
+        all_hits = self.query_index(s, return_all=True)
         uuids_docs = []
         for hit in all_hits:
             source_data = hit.to_dict()["_source"]
 
             # Base document with required fields
-            doc = {
-                self.uuid_field: source_data[self.uuid_field],
-                self.version_field: source_data[self.version_field]
-            }
-
-            # Handle buildUrl with fallback to build_url
-            if "buildUrl" in source_data:
-                doc["buildUrl"] = source_data["buildUrl"]
-            elif "build_url" in source_data:
-                doc["buildUrl"] = source_data["build_url"]
-            else:
-                doc["buildUrl"] = "http://bogus-url"
+            doc = source_data
 
             # Add additional fields if requested
-            if additional_fields:
-                for field in additional_fields:
-                    doc[field] = source_data.get(field, "N/A")
+            for field in additional_fields:
+                doc[field] = source_data.get(field, "N/A")
 
             uuids_docs.append(doc)
         return uuids_docs
-
-    def match_kube_burner(self, uuids: List[str],
-                          timestamp_field: str = "timestamp") -> List[Dict[str, Any]]:
-        """match kube burner runs
-        Args:
-            uuids (list): list of uuids
-            timestamp_field (str): timestamp field in data
-        Returns:
-            list : list of runs
-        """
-        query = Q(
-            "bool",
-            filter=[
-                Q("terms", **{self.uuid_field+".keyword": uuids}),
-                Q("match", metricName="jobSummary"),
-                ~Q("match", **{"jobConfig.name": "garbage-collection"}),
-            ],
-        )
-        search = (
-            Search(using=self.es, index=self.index)
-            .query(query)
-            .extra(size=self.search_size)
-            .sort({timestamp_field: {"order": "desc"}})
-        )
-        all_hits = self.query_index(search, return_all=True)
-        runs = [hit.to_dict()["_source"] for hit in all_hits]
-        return runs
-
-    def filter_runs(self, pdata: Dict[Any, Any], data: Dict[Any, Any]) -> List[str]:
-        """filter out runs with different jobIterations
-        Args:
-            pdata (_type_): _description_
-            data (_type_): _description_
-        Returns:
-            _type_: _description_
-        """
-        columns = [self.uuid_field, "jobConfig.jobIterations"]
-        pdf = pd.json_normalize(pdata)
-        pick_df = pd.DataFrame(pdf, columns=columns)
-        iterations = pick_df.iloc[0]["jobConfig.jobIterations"]
-        df = pd.json_normalize(data)
-        ndf = pd.DataFrame(df, columns=columns)
-        ids_df = ndf.loc[df["jobConfig.jobIterations"] == iterations]
-        return ids_df[self.uuid_field].to_list()
 
     def get_results(
         self, uuid: str,
         uuids: List[str],
         metrics: Dict[str, Any],
         timestamp_field: str = "timestamp"
-    ) -> Dict[Any, Any]:
+    ) -> List[Dict[str, Any]]:
         """
         Get results of elasticsearch data query based on uuid(s) and defined metrics
 
         Args:
-            uuid (str): _description_
-            uuids (list): _description_
-            metrics (dict): _description_
+            uuid (str): uuid of the run
+            uuids (list): list of uuids to get results for
+            metrics (dict): metrics to get results for
             timestamp_field (str): timestamp field in data
 
         Returns:
-            dict: Resulting data from query
+            list: List of result dictionaries
         """
         if len(uuids) > 1 and uuid in uuids:
             uuids.remove(uuid)

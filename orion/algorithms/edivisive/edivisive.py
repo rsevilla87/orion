@@ -3,6 +3,7 @@
 # pylint: disable = line-too-long
 from typing import Dict, List
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 from hunter.series import ChangePoint
 from orion.algorithms.algorithm import Algorithm
 
@@ -16,7 +17,7 @@ class EDivisive(Algorithm):
 
 
     def _analyze(self):
-        if not (pd.api.types.is_numeric_dtype(self.dataframe["timestamp"]) and self.dataframe["timestamp"].astype(int).min() > 1e9):
+        if not (is_numeric_dtype(self.dataframe["timestamp"]) and self.dataframe["timestamp"].astype(int).min() > 1e9):
             self.dataframe["timestamp"] = pd.to_datetime(self.dataframe["timestamp"])
             self.dataframe["timestamp"] = self.dataframe["timestamp"].astype(int) // 10**9
         series = self.setup_series()
@@ -32,12 +33,12 @@ class EDivisive(Algorithm):
 
         # filter by direction and ack'ed issues
         for metric, changepoint_list in change_points_by_metric.items():
-            for i in range(len(changepoint_list)-1, -1, -1):
+            for i in range(len(changepoint_list) -1, -1, -1):
                 deleted = False
-                if (self._has_changepoint(metric, changepoint_list, i) or
-                    self._is_acked(ackSet, changepoint_list, i) or
-                    self._is_under_threshold(metric, changepoint_list, i)):
-                    deleted=True
+                if (self._has_changepoint(metric, changepoint_list[i]) or
+                    self._is_acked(ackSet, changepoint_list[i]) or
+                    self._is_under_threshold(metric, changepoint_list[i])):
+                    deleted = True
                     del changepoint_list[i]
                 if (not deleted and self.metrics_config[metric]["correlation"] != ""):
                     has_depending_changepoint = self._depending_metric_has_chagepoint(change_points_by_metric,
@@ -61,22 +62,22 @@ class EDivisive(Algorithm):
         changepoint_list = change_points_by_metric[depending_metric]
         for i in range(len(changepoint_list)-1, -1, -1):
             if (changepoint_list[i].index >= index-context) and (changepoint_list[i].index <= index+context):
-                if (self._has_changepoint(depending_metric, changepoint_list, i) or
-                    self._is_acked(ackSet, changepoint_list, i) or
-                    self._is_under_threshold(depending_metric, changepoint_list, i)):
+                if (self._has_changepoint(depending_metric, changepoint_list[i]) or
+                    self._is_acked(ackSet, changepoint_list[i]) or
+                    self._is_under_threshold(depending_metric, changepoint_list[i])):
                     return False
                 return True
         return False
 
 
-    def _is_under_threshold(self, metric, changepoint_list, i):
-        return self.metrics_config[metric]["threshold"] > abs((changepoint_list[i].stats.mean_1 - changepoint_list[i].stats.mean_2)/changepoint_list[i].stats.mean_1)*100
+    def _is_under_threshold(self, metric, changepoint):
+        return self.metrics_config[metric]["threshold"] > abs((changepoint.stats.mean_1 - changepoint.stats.mean_2)/changepoint.stats.mean_1)*100
 
 
-    def _is_acked(self, ackSet, changepoint_list, i):
-        return str(changepoint_list[i].index) + "_" + changepoint_list[i].metric in ackSet
+    def _is_acked(self, ackSet, changepoint):
+        return str(changepoint.index) + "_" + changepoint.metric in ackSet
 
 
-    def _has_changepoint(self, metric, changepoint_list, i):
-        return ((self.metrics_config[metric]["direction"] == 1 and changepoint_list[i].stats.mean_1 > changepoint_list[i].stats.mean_2) or
-                (self.metrics_config[metric]["direction"] == -1 and changepoint_list[i].stats.mean_1 < changepoint_list[i].stats.mean_2))
+    def _has_changepoint(self, metric, changepoint):
+        return ((self.metrics_config[metric]["direction"] == 1 and changepoint.stats.mean_1 > changepoint.stats.mean_2) or
+                (self.metrics_config[metric]["direction"] == -1 and changepoint.stats.mean_1 < changepoint.stats.mean_2))

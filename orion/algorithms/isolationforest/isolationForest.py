@@ -2,6 +2,7 @@
 """The implementation module for Isolation forest and weighted mean"""
 from sklearn.ensemble import IsolationForest
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 from hunter.series import  ChangePoint, ComparativeStats
 from orion.logger import SingletonLogger
 from orion.algorithms.algorithm import Algorithm
@@ -11,19 +12,17 @@ class IsolationForestWeightedMean(Algorithm):
     """Isolation forest with weighted mean
 
     Args:
-        Algorithm (Algorithm): _description_
+        Algorithm (Algorithm): Inherits
     """
 
     def _analyze(self):
         """Analyzing the data
 
-        Args:
-            dataframe (pd.DataFrame): _description_
-
         Returns:
-            pd.Dataframe, pd.Dataframe: _description_
+            series: data series that contains attributes and full dataframe
+            change_points_by_metric: list of ChangePoints
         """
-        if not (pd.api.types.is_numeric_dtype(self.dataframe["timestamp"]) and self.dataframe["timestamp"].astype(int).min() > 1e9):
+        if not (is_numeric_dtype(self.dataframe["timestamp"]) and self.dataframe["timestamp"].astype(int).min() > 1e9):
             self.dataframe["timestamp"] = pd.to_datetime(self.dataframe["timestamp"])
             self.dataframe["timestamp"] = self.dataframe["timestamp"].astype(int) // 10**9
         dataframe = self.dataframe.copy(deep=True)

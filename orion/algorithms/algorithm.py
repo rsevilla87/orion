@@ -9,7 +9,6 @@ import pandas as pd
 from tabulate import tabulate
 from hunter.report import Report, ReportType
 from hunter.series import Series, Metric, ChangePoint, ChangePointGroup
-from orion.matcher import Matcher
 import orion.constants as cnsts
 
 
@@ -21,18 +20,14 @@ class Algorithm(ABC): # pylint: disable = too-many-arguments, too-many-instance-
 
     def __init__(
         self,
-        matcher: Matcher,
         dataframe: pd.DataFrame,
         test: dict,
         options: dict,
         metrics_config: dict[str, dict],
-        version_field: str = "ocpVersion",
         uuid_field: str = "uuid"
     ) -> None:
-        self.matcher = matcher
         self.dataframe = dataframe
         self.test = test
-        self.version_field = version_field
         self.options = options
         self.metrics_config = metrics_config
         self.regression_flag = False
@@ -42,13 +37,12 @@ class Algorithm(ABC): # pylint: disable = too-many-arguments, too-many-instance-
         """Method to output json output
 
         Returns:
-            Tuple[str, str]: returns test_name and json output
+            Tuple[str, str, bool]: returns test_name, json output and regression flag
         """
         _, change_points_by_metric = self._analyze()
         dataframe_json = self.dataframe.to_json(orient="records")
         dataframe_json = json.loads(dataframe_json)
         collapsed_json = []
-
         for index, entry in enumerate(dataframe_json):
             entry["metrics"] = {
                 key: {"value": entry.pop(key),
@@ -99,14 +93,14 @@ class Algorithm(ABC): # pylint: disable = too-many-arguments, too-many-instance-
     def output_text(self) -> Tuple[str, str, bool]:
         """Outputs the data in text/tabular format"""
         # If display field is specified, use our custom combined table
-        display_field = self.options.get("display")
-        if display_field:
+        display_fields = self.options.get("display")
+        if display_fields:
             _, json_output, _ = self.output_json()
             data_json = json.loads(json_output)
 
             # Create a combined table with all metrics and the display field
             combined_output = self._generate_combined_table_with_display(
-                data_json, display_field
+                data_json, display_fields
             )
             return self.test["name"], combined_output, self.regression_flag
 
@@ -122,7 +116,7 @@ class Algorithm(ABC): # pylint: disable = too-many-arguments, too-many-instance-
         return self.test["name"], output_table, self.regression_flag
 
     def _generate_combined_table_with_display(
-        self, data_json: List[Dict], display_field: str
+        self, data_json: List[Dict], display_fields: List[str]
     ) -> str:
         """Generate a combined table with all metrics and display field."""
 
@@ -137,17 +131,11 @@ class Algorithm(ABC): # pylint: disable = too-many-arguments, too-many-instance-
             # Add timestamp
             timestamp = datetime.fromtimestamp(
                 record["timestamp"], timezone.utc
-            ).strftime("%Y-%m-%d %H:%M:%S +0000")
+            ).strftime("%Y-%m-%d %H:%M:%S")
             row.append(timestamp)
 
             # Add UUID
             row.append(record[self.uuid_field])
-
-            # Add ocpVersion
-            row.append(record.get(self.version_field, "N/A"))
-
-            # Add buildUrl
-            row.append(record["buildUrl"])
 
             # Add all metric values
             for metric_name in self.metrics_config.keys():
@@ -163,15 +151,15 @@ class Algorithm(ABC): # pylint: disable = too-many-arguments, too-many-instance-
                     row.append("N/A")
 
             # Add display field value
-            display_value = record.get(display_field, "N/A")
-            row.append(str(display_value))
+            for field in display_fields:
+                row.append(record.get(field, "N/A"))
 
             table_data.append(row)
 
         # Prepare headers
-        headers = ["time", self.uuid_field, self.version_field, "buildUrl"]
+        headers = ["time", self.uuid_field]
         headers.extend(self.metrics_config.keys())
-        headers.append(display_field)
+        headers.extend(display_fields)
 
         # Create the table
         table = tabulate(table_data, headers=headers, tablefmt="simple")
@@ -232,9 +220,7 @@ class Algorithm(ABC): # pylint: disable = too-many-arguments, too-many-instance-
 
     def setup_series(self) -> Series:
         """
-        Returns series
-        Returns:
-            _type_: _description_
+        Returns hunter.Series
         """
         metrics = {
             column: Metric(value.get("direction", 1), 1.0)
@@ -244,7 +230,7 @@ class Algorithm(ABC): # pylint: disable = too-many-arguments, too-many-instance-
         attributes = {
             column: self.dataframe[column]
             for column in self.dataframe.columns
-            if column in [self.uuid_field, "buildUrl", self.version_field]
+            if column in [self.uuid_field]
         }
         series = Series(
             test_name=self.test["name"],

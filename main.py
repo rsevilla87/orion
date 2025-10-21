@@ -30,6 +30,16 @@ class Dictionary(click.ParamType):
     def convert(self, value: Any, param: Any, ctx: Any) -> dict:
         return json.loads(value)
 
+class List(click.ParamType):
+    """Class to define a custom click type for lists
+
+    Args:
+        click (ParamType):
+    """
+    name = "list"
+    def convert(self, value: Any, param: Any, ctx: Any) -> list:
+        return value.split(",") if value else []
+
 class MutuallyExclusiveOption(click.Option):
     """Class to implement mutual exclusivity between options in click
 
@@ -111,19 +121,16 @@ def validate_anomaly_options(ctx, param, value: Any) -> Any: # pylint: disable =
 )
 @click.option("--save-output-path", default="output.txt", help="path to save output file with regressions")
 @click.option("--uuid", default="", help="UUID to use as base for comparisons")
-@click.option(
-    "--baseline", default="", help="Baseline UUID(s) to to compare against uuid"
-)
 @click.option("--lookback", help="Get data from last X days and Y hours. Format in XdYh")
 @click.option("--convert-tinyurl", is_flag=True, help="Convert buildUrls to tiny url format for better formatting")
 @click.option("--collapse", is_flag=True, help="Only outputs changepoints, previous and later runs in the xml format")
-@click.option("--node-count", default=False, help="Match any node iterations count")
 @click.option("--lookback-size", type=int, default=10000, help="Maximum number of entries to be looked back")
 @click.option("--es-server", type=str, envvar="ES_SERVER", help="Elasticsearch endpoint where test data is stored, can be set via env var ES_SERVER", default="")
 @click.option("--benchmark-index", type=str, envvar="es_benchmark_index",  help="Index where test data is stored, can be set via env var es_benchmark_index", default="")
 @click.option("--metadata-index", type=str, envvar="es_metadata_index",  help="Index where metadata is stored, can be set via env var es_metadata_index", default="")
 @click.option("--input-vars", type=Dictionary(), default="{}", help='Arbitrary input variables to use in the config template, for example: {"version": "4.18"}')
-@click.option("--display", type=str, help="Add metadata field as a column in the output (e.g., ocpVirt, releaseStream)")
+@click.option("--display", type=List(), default='["ocpVersion", "upstreamJob"]', help="Add metadata field as a column in the output (e.g., ocpVirt, releaseStream)")
+@click.option("--version-field", type=str, default="ocpVersion", help="Field name that holds the versioning information")
 def main(**kwargs):
     """
     Orion runs on command line mode, and helps in detecting regressions

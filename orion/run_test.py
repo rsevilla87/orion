@@ -9,7 +9,7 @@ from orion.matcher import Matcher
 from orion.logger import SingletonLogger
 from orion.algorithms import AlgorithmFactory
 import orion.constants as cnsts
-from orion.utils import Utils, get_subtracted_timestamp
+from orion.utils import Utils, get_subtracted_timestamp, NoDataFound
 
 def get_algorithm_type(kwargs):
     """Switch Case of getting algorithm name
@@ -54,42 +54,32 @@ def run(**kwargs: dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
     result_output = {}
     regression_flag = False
     for test in config["tests"]:
+
+        uuid_field = test.get("uuid_field", "uuid")
+
+        utils = Utils(uuid_field)
         # Create fingerprint Matcher
-
-        version_field = "ocpVersion"
-        if "version" in test:
-            version_field=test["version"]
-        uuid_field = "uuid"
-        if "uuid_field" in test:
-            uuid_field=test["uuid_field"]
-
-        utils = Utils(uuid_field, version_field)
         matcher = Matcher(
             index=kwargs["metadata_index"],
             es_server=kwargs["es_server"],
             verify_certs=False,
-            version_field=version_field,
             uuid_field=uuid_field
         )
 
         start_timestamp = get_start_timestamp(kwargs)
-        fingerprint_matched_df, metrics_config = utils.process_test(
-            test,
-            matcher,
-            kwargs,
-            start_timestamp
-        )
-
-        if fingerprint_matched_df is None:
-            sys.exit(3) # No data present
-
-        # Temp solution until metadata is fixed
-        if "metadata" in test and "jobType" in test["metadata"]:
-            search_string = "/periodic"
-            if test["metadata"]["jobType"] == "periodic":
-                fingerprint_matched_df = fingerprint_matched_df[
-                    (fingerprint_matched_df['buildUrl'].str.contains(search_string))]
-                fingerprint_matched_df.reset_index(drop=True, inplace=True)
+        try:
+            fingerprint_matched_df, metrics_config = utils.process_test(
+                test,
+                matcher,
+                kwargs,
+                start_timestamp
+            )
+        except NoDataFound as err:
+            logger.error(err)
+            sys.exit(3)
+        if fingerprint_matched_df.empty:
+            logger.error("Empty dataframe returned for test %s", test["name"])
+            sys.exit(3)
 
         algorithm_name = get_algorithm_type(kwargs)
         if algorithm_name is None:
@@ -100,12 +90,10 @@ def run(**kwargs: dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
         algorithmFactory = AlgorithmFactory()
         algorithm = algorithmFactory.instantiate_algorithm(
                 algorithm_name,
-                matcher,
                 fingerprint_matched_df,
                 test,
                 kwargs,
                 metrics_config,
-                version_field,
                 uuid_field
             )
         # This is env is only present in prow ci
@@ -124,29 +112,31 @@ def run(**kwargs: dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
             testname, result_data, test_flag = algorithm.output(cnsts.JSON)
             prev_ver = None
             bad_ver = None
-            for result in json.loads(result_data):
-                if result["is_changepoint"]:
-                    bad_ver = result[version_field]
-                else:
-                    prev_ver = result[version_field]
-                if prev_ver is not None and bad_ver is not None:
-                    if sippy_pr_search:
-                        prs = Utils().sippy_pr_diff(prev_ver, bad_ver)
-                        doc = {"prev_ver": prev_ver,
-                                "bad_ver": bad_ver}
-                        # We have seen where sippy_pr_diff returns an empty list of PRs
-                        # since there is a change the payload tests have not completed.
-                        if prs:
-                            doc["prs"] = prs
-                        regression_data.append(doc)
+            if kwargs["version_field"]:
+                version_field = kwargs.get("version_field")
+                for result in json.loads(result_data):
+                    if result["is_changepoint"]:
+                        bad_ver = result[version_field]
                     else:
-                        regression_data.append({
-                            "prev_ver": prev_ver,
-                            "bad_ver": bad_ver,
-                            "prs": []
-                        })
-                    prev_ver = None
-                    bad_ver = None
+                        prev_ver = result[version_field]
+                    if prev_ver is not None and bad_ver is not None:
+                        if sippy_pr_search:
+                            prs = Utils().sippy_pr_diff(prev_ver, bad_ver)
+                            doc = {"prev_ver": prev_ver,
+                                    "bad_ver": bad_ver}
+                            # We have seen where sippy_pr_diff returns an empty list of PRs
+                            # since there is a change the payload tests have not completed.
+                            if prs:
+                                doc["prs"] = prs
+                            regression_data.append(doc)
+                        else:
+                            regression_data.append({
+                                "prev_ver": prev_ver,
+                                "bad_ver": bad_ver,
+                                "prs": []
+                            })
+                        prev_ver = None
+                        bad_ver = None
 
         regression_flag = regression_flag or test_flag
     return result_output, regression_flag, regression_data

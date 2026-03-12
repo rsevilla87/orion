@@ -1,6 +1,7 @@
 """metadata matcher"""
 
 # pylint: disable = invalid-name, invalid-unary-operand-type, no-member
+import json
 from datetime import datetime
 from typing import List, Dict, Any
 
@@ -91,7 +92,6 @@ class Matcher:
 
             all_hits.extend(hits)
             search_after = response.hits[-1].meta.sort
-
         return all_hits
 
     # pylint: disable=too-many-locals
@@ -330,6 +330,7 @@ class Matcher:
             timestamp_field (str): timestamp field in data
 
         """
+        self.logger.info("Getting agg metric query for uuids: %s", uuids)
         metric_queries = []
         not_queries = [
             ~Q("match", **{not_item_key: not_item_value})
@@ -338,7 +339,7 @@ class Matcher:
         metric_queries = [
             Q("match", **{metric_key: metric_value})
             for metric_key, metric_value in metrics.items()
-            if metric_key not in ["name", "metric_of_interest", "not", "agg"]
+            if metric_key not in ["name", "metric_of_interest", "not", "agg", "bucket"]
         ]
         metric_query = Q("bool", must=metric_queries + not_queries)
         query = Q(
@@ -351,18 +352,15 @@ class Matcher:
         search = (
             Search(using=self.es, index=self.index)
             .query(query)
-            .extra(size=self.search_size)
+            .extra(size=0)
             .sort({timestamp_field: {"order": "desc"}})
         )
         agg_value = metrics["agg"]["value"]
         agg_type = metrics["agg"]["agg_type"]
-        search.aggs.bucket(
-            "time", "terms", field=self.uuid_field+".keyword", size=self.search_size
-        ).metric("time", "avg", field=timestamp_field)
-        search.aggs.bucket(
-            "uuid", "terms", field=self.uuid_field+".keyword", size=self.search_size
-        ).metric(agg_value, agg_type, field=metrics["metric_of_interest"])
-        result = self.query_index(search)
+        uuid_bucket = search.aggs.bucket("uuid", "terms", field=self.uuid_field+".keyword")
+        uuid_bucket.metric("time", "avg", field=timestamp_field)
+        uuid_bucket.metric(agg_value, agg_type, field=metrics["metric_of_interest"])
+        result = search.execute()
         data = self.parse_agg_results(result, agg_value, agg_type, timestamp_field)
         return data
 
@@ -384,21 +382,10 @@ class Matcher:
         if "aggregations" not in data:
             return res
 
-        stamps = data.aggregations.time.buckets
-        agg_buckets = data.aggregations.uuid.buckets
-
-        for stamp in stamps:
-            dat = {}
-            dat[self.uuid_field] = stamp.key
-            dat[timestamp_field] = stamp.time.value_as_string
-            agg_values = next(
-                (item for item in agg_buckets if item.key == stamp.key), None
-            )
-            if agg_values:
-                dat[agg_value + "_" + agg_type] = agg_values[agg_value].value
-            else:
-                dat[agg_value + "_" + agg_type] = None
-            res.append(dat)
+        uuids = data.aggregations.uuid.buckets
+        for uuid in uuids:
+            data = {"uuid": uuid.key, timestamp_field: uuid.time.value_as_string, agg_value + "_" + agg_type: uuid.get(agg_value).value}
+            res.append(data)
         return res
 
     def convert_to_df(
